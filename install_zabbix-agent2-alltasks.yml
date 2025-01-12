@@ -1,0 +1,159 @@
+---
+- name: Configure Zabbix Agent 2 and Register Hosts
+  hosts: zabbix_agents
+  become: yes
+
+  vars:
+    zabbix_server_ip: "{{ zabbix_server_ip }}"  # Replace with your Zabbix server IP
+    ansible_distribution_codename: "{{ ansible_distribution_codename | default('jammy') }}"
+    zabbix_agent_repository: "deb [arch=amd64] https://repo.zabbix.com/zabbix/6.0/ubuntu {{ ansible_distribution_codename }} main"
+    proxy_address_apt: "{{ proxy_address_apt }}"  # Replace with your proxy address if needed
+    cert_url: "https://repo.zabbix.com/zabbix-official-repo.key"
+    zabbix_repo_deb_file: "/tmp/zabbix-release_6.0-3+ubuntu18.04_all.deb"
+    zabbix_agent_packages:
+      - zabbix-agent2
+      - zabbix-agent2-plugin-*
+
+  tasks:
+    - name: Download Zabbix repository GPG key
+      ansible.builtin.get_url:
+        url: "{{ cert_url }}"
+        dest: "/tmp/zabbix-official-repo.key"
+        mode: '0644'
+      environment:
+        http_proxy: "{{ proxy_address_apt }}"
+        https_proxy: "{{ proxy_address_apt }}"
+      register: download_result
+      failed_when: download_result.failed
+
+    - name: Add Zabbix repository GPG key
+      ansible.builtin.shell: gpg --no-default-keyring --keyring /usr/share/keyrings/zabbix-archive-keyring.gpg --import /tmp/zabbix-official-repo.key
+      args:
+        executable: /bin/bash
+      register: gpg_import_result
+      changed_when: "'not changed' not in gpg_import_result.stdout"
+
+    - name: Cleanup downloaded key file
+      ansible.builtin.file:
+        path: "/tmp/zabbix-official-repo.key"
+        state: absent
+      when: download_result.changed or gpg_import_result.changed
+
+    - name: Add Zabbix repository for Ubuntu
+      ansible.builtin.copy:
+        content: "{{ zabbix_agent_repository }}"
+        dest: "/etc/apt/sources.list.d/zabbix.list"
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      environment:
+        http_proxy: "{{ proxy_address_apt }}"
+        https_proxy: "{{ proxy_address_apt }}"
+
+    - name: Install Zabbix Agent 2 and plugins
+      ansible.builtin.apt:
+        name: "{{ zabbix_agent_packages }}"
+        state: present
+      environment:
+        http_proxy: "{{ proxy_address_apt }}"
+        https_proxy: "{{ proxy_address_apt }}"
+
+    - name: Generate Zabbix Agent configuration file
+      ansible.builtin.template:
+        src: "zabbix_agentd2.conf.j2"
+        dest: "/etc/zabbix/zabbix_agent2.conf"
+
+- name: Decrypt secret.psk file
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Ensure secret.psk is decrypted
+      ansible.builtin.shell: "ansible-vault decrypt secret.psk --output /tmp/secret.psk"
+      args:
+        creates: /tmp/secret.psk
+
+- name: Copy decrypted secret.psk file to Zabbix agent targets
+  hosts: zabbix_agents
+  become: yes
+  tasks:
+    - name: Copy decrypted secret.psk file to Zabbix agents
+      ansible.builtin.copy:
+        src: "/tmp/secret.psk"
+        dest: "/etc/zabbix/secret.psk"
+        mode: "0600"
+
+- name: Register Zabbix agents and configure auto-registration actions
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Ensure Zabbix API Python module is installed
+      ansible.builtin.pip:
+        name: py-zabbix
+        state: present
+
+    - name: Create Zabbix auto-registration action
+      zabbix_action:
+        server_url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+        login_user: "{{ zabbix_admin_username }}"
+        login_password: "{{ zabbix_admin_password }}"
+        name: "Auto-Register Linux Systems"
+        eventsource: 2
+        status: 0
+        filter: 
+          - conditions:
+              - conditiontype: 24
+                value: "Linux"
+                operator: 2
+                formulaid: 0
+        operations:
+          - operationtype: 2
+            actionid: 0
+            opgroup:
+              - groupid: "{{ linux_servers_group_id }}"
+                operationid: 0
+            optemplate:
+              - templateid: "{{ linux_template_id }}"
+                operationid: 0
+            opmessage: []
+            opcommand: []
+
+    - name: Get Linux servers group ID
+      zabbix_hostgroup_facts:
+        server_url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+        login_user: "{{ zabbix_admin_username }}"
+        login_password: "{{ zabbix_admin_password }}"
+        name: "Linux servers"
+      register: linux_servers_group_facts
+
+    - name: Get Linux template ID
+      zabbix_template_facts:
+        server_url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+        login_user: "{{ zabbix_admin_username }}"
+        login_password: "{{ zabbix_admin_password }}"
+        name: "Linux by Zabbix agent active ZSO"
+      register: linux_template_facts
+
+- name: Add Zabbix host groups and link templates to hosts
+  hosts: zabbix_agents
+  become: yes
+  tasks:
+    - name: Add Linux servers group to hosts
+      zabbix_hostgroup:
+        server_url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+        login_user: "{{ zabbix_admin_username }}"
+        login_password: "{{ zabbix_admin_password }}"
+        name: "Linux servers"
+        state: present
+      register: linux_servers_group_result
+
+    - name: Link Linux template to hosts
+      zabbix_host_template:
+        server_url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+        login_user: "{{ zabbix_admin_username }}"
+        login_password: "{{ zabbix_admin_password }}"
+        host: "{{ ansible_hostname }}"
+        templates:
+          - "{{ linux_template_id }}"
+        state: present
